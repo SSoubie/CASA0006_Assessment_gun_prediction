@@ -1,0 +1,347 @@
+library(tidyverse)
+library(sf)
+library(lubridate)
+
+
+##################
+# Armado de Base #
+##################
+
+# OBJETIVO: En este script vamos a trabajar en el armado de la base para machine learning.
+#           La temática va a ser inseguridad y va a poner el foco en los delitos cometidos
+#           con motos en la Ciudad de Buenos Aires.
+
+# Nuestra principal fuente información van a ser las bases de delitos de la CABA. Pueden encontrar las mismas en https://data.buenosaires.gob.ar/dataset/delitos
+
+
+# Para comenzar con la carga de los datos, creemos una funcion auxiliar que tome
+# un path, aplique la función read_excel sobre la misma, e itere sobre un vector
+# de sheets a leer.
+read_many_csv <- function(x) {
+  
+  map(x,
+      ~ read_csv(x))
+  
+}
+
+# Ahora, creemos una lista de archivos a levantar.
+archivos <- list.files("data/") %>% 
+  tibble(archivos = .) %>% 
+  filter(str_detect(archivos, "delitos")) %>% 
+  mutate(ruta = paste0("data/", archivos))
+
+# Cargamos las bases
+delito <- archivos %>% 
+  mutate(anios = map(.x = ruta, # Vector sobre lque va a iterar la función siguiente.
+                     .f = ~ read_csv(ruta,
+                                     na = "NULL")) # Argumentos fijos.
+  )
+
+# Unimos en un solo dataset
+delito <- bind_rows(delito$anios)
+
+# Miramos los datos
+# delito %>% head(10) %>% view()
+
+# Eliminamos las columnas que no vamos a usar.
+delito <- delito %>% 
+  select(-cantidad)
+
+# Nos quedamos solo con los delitos que fueron realizados en moto y tienen una coordenada georeferenciada.
+delito <- delito %>% 
+  filter(uso_moto == "SI") %>% 
+  drop_na(latitud, longitud) #581499
+
+# Creemos un par de variables extra.
+delito <- delito %>% 
+  mutate(comuna = paste("Comuna", comuna), # Pegamos la etiqueta "Comuna" al número de Comuna.
+         uso_arma = if_else(uso_arma == "SI", # Traducimos el uso de arma
+                            "yes",
+                            "no"),
+         subtipo = case_when(subtipo == "Robo total" ~ "Theft", # Traducimos los tipos de robo.
+                             subtipo == "Robo automotor" ~ "Car Theft",
+                             T ~ subtipo),
+         franja = as.numeric(franja), # Transformamos la variable franja a numérica para poder hacer cálculos.
+         # Creamos la variable "Ciclo laboral"
+         ciclo_laboral = case_when(mes %in% c("ENERO", "FEBRERO", "DICIEMBRE") ~ "Holidays",
+                                   T ~ "Workdays"),
+         # Creamos la variable "Fin de Semana"
+         fin_de_semana = case_when(dia %in% c("SABADO", "DOMINGO") ~ "yes",
+                                   T ~ "no"),
+         # Creamos la variable "Noche"
+         noche = case_when(franja < 7 | franja >= 18 ~ "yes",
+                           T ~ "no"),
+         # Creamos la variable "Horario bancario"
+         horario_bancario = case_when((franja >= 10 & franja < 18) & fin_de_semana == "no" ~ "yes",
+                                      T ~ "no"),
+         fecha = ymd(fecha), # Transformamos la variable fecha en fecha.
+         day_month = day(fecha), # Extraemos el día del mes.
+         # Creamos una variable que determine el primer día del mes.
+         principo_mes = if_else(day_month <= 7, 
+                                "yes",
+                                "no"),
+         # Creamos una variable que determine la última semana del mes
+         fin_de_mes = if_else(day_month >= 24,
+                              "yes",
+                              "no"),
+         mes = recode(str_to_lower(mes),
+                      "enero"      = "January",
+                      "febrero"    = "February",
+                      "marzo"      = "March",
+                      "abril"      = "April",
+                      "mayo"       = "May",
+                      "junio"      = "June",
+                      "julio"      = "July",
+                      "agosto"     = "August",
+                      "septiembre" = "September",
+                      "octubre"    = "October",
+                      "noviembre"  = "November",
+                      "diciembre"  = "December"),
+         dia = recode(str_to_lower(dia),
+                      "lunes"     = "Monday",
+                      "martes"    = "Tuesday",
+                      "miercoles" = "Wednesday",  
+                      "jueves"    = "Thursday",
+                      "viernes"   = "Friday",
+                      "sabado"    = "Saturday",   
+                      "domingo"   = "Sunday"))
+
+
+# Transformamos nuestro dataset en espacial
+delito <- delito %>%
+  st_as_sf(coords = c("longitud", "latitud"),
+           crs = "4326")
+
+# Seteamos el sistema de coordenadas 4326 para realizar operaciones espaciales.
+delito <- delito %>%
+  st_set_crs(4326)
+
+# Cargamos las geometrías de los barrios de caba
+caba <- read_sf("data/barrios.geojson") %>% 
+  st_transform(st_crs(delito)) %>% 
+  st_make_valid()
+
+# Nos quedamos solo con los casos que entran dentro de la CABA
+delito <- st_filter(delito,
+                    caba,
+                    .predicate = st_intersects) #581265
+
+# Asuminos registros únicos
+# Nos quedamos solo con los caos únicos.
+delito <- delito %>%
+  distinct() #64585
+
+# Seteamos el sistema de coordenadas de CABA.
+crs_ba <- 5347 # Posgar 2007 - Argentina 5.
+
+# Convertimos nuestro ccr de los delitos para aplicar cálculos espaciales precisos.
+delito <- delito %>% 
+  st_transform(st_crs(crs_ba))
+
+# Ahora, vamos a enriquecer nuestros datos con otras fuentes de información.
+
+# Comisarías
+# Fuente: BA DATA
+# Puede ser encontrado en https://data.buenosaires.gob.ar/dataset/comisarias-policia-ciudad
+comisarias <- read_sf("data/comisarias_policia.geojson") %>% 
+  st_transform(st_crs(delito)) %>% 
+  select(1:2)
+
+# Cargamos el callejero de la ciudad
+# Fuente: BA DATA
+# Puede ser encontrado en https://data.buenosaires.gob.ar/dataset/calles
+callejero <- read_sf("data/callejero.geojson") %>% 
+  select(nomoficial, tipo_c) %>% 
+  st_transform(st_crs(delito)) %>% 
+  #Reducimos tipos
+  mutate(tipo_c = case_when(str_detect(tipo_c, "AUTOPISTA") ~ "Highway",
+                            str_detect(tipo_c, "PASAJE") ~ "Street",
+                            str_detect(tipo_c, "CALLE") ~ "Street",
+                            tipo_c == "BOULEVARD" ~ "Avenue",
+                            tipo_c == "AVENIDA" ~ "Avenue",
+                            tipo_c == "SENDERO" ~ "Path",
+                            tipo_c == "PUENTE" ~ "Other",
+                            tipo_c == "TÚNEL" ~ "Other",
+                            T ~ tipo_c))
+
+# summary(as.factor(callejero$tipo_c))
+
+# Cajeros automáticos
+# Fuente: BA DATA
+# Puede ser encontrado en https://data.buenosaires.gob.ar/dataset/cajeros-automaticos
+cajeros <- read.csv("data/cajeros-automaticos.csv") %>% 
+  st_as_sf(coords = c("long", "lat"),
+           crs = 4326) %>% 
+  st_transform(st_crs(delito)) %>% 
+  filter(localidad == "CABA") %>% 
+  select(banco, red, terminales)
+
+# Bancos
+# Fuente: BA DATA
+# Puede ser encontrado en https://data.buenosaires.gob.ar/dataset/bancos
+bancos <- read.csv("data/bancos.csv", 
+                   sep = ";",
+                   encoding = "latin1") %>% 
+  # We have to correct its coordinates.
+  mutate(across(.cols = c("long", "lat"),
+                ~ . %>%
+                  str_remove_all("[:punct:]")))
+
+str_sub(bancos$lat, end = 2, omit_na = FALSE) <- "34."; bancos$lat
+str_sub(bancos$long, end = 2, omit_na = FALSE) <- "58."; bancos$long
+
+bancos <- bancos %>% 
+  mutate(across(.cols = c("long", "lat"),
+                ~ . %>%
+                  as.numeric()*-1)) %>% 
+  st_as_sf(coords = c("long", "lat"),
+           crs = 4326)
+
+bancos <- bancos %>% 
+  st_transform(st_crs(delito))
+
+# Vamos a calcular las distancias a distintas infraestructuras claves.
+# Comisarías
+idx <- st_nearest_feature(delito, comisarias)
+
+distancias <- st_distance(delito, comisarias[idx, ], by_element = TRUE)
+
+delito$dist_comisaria <- distancias    
+
+
+# Cajeros
+idx <- st_nearest_feature(delito, cajeros)
+
+distancias <- st_distance(delito, cajeros[idx, ], by_element = TRUE)
+
+delito$dist_cajeros <- distancias
+
+
+# Bancos
+idx <- st_nearest_feature(delito, bancos)
+
+distancias <- st_distance(delito, bancos[idx, ], by_element = TRUE)
+
+delito$dist_bancos <- distancias
+
+# Sumamos info del cajero más cercano
+delito <- 
+  st_join(
+    delito,
+    cajeros,
+    join = st_nearest_feature,
+    suffix = c("", "_nearest")
+  )
+
+# Sumamos info del tipo de calle en la que ocurrió el delito 
+delito <- st_join(
+  delito,
+  callejero,
+  join = st_nearest_feature,
+  suffix = c("", "_nearest")
+)
+
+# Generamos algunos umbrales de distancias
+delito <- delito %>% 
+  # Primero, transformamos nuestras variables en numéricas.
+  mutate(across(.cols = c("dist_cajeros", "dist_comisaria", "dist_bancos"), 
+                ~ . %>% as.numeric()),
+         # Delito a menos de 100mts de un cajero
+         cajeros_a_100 = if_else(dist_cajeros <= 100,
+                                 "yes",
+                                 "no"),
+         # Delito a menos de 200mts de un cajero
+         cajeros_a_200 = if_else(dist_cajeros <= 200,
+                                 "yes",
+                                 "no"),
+         # Delito a menos de 100mts de una comisaría
+         comisarias_a_100 = if_else(dist_comisaria <= 100,
+                                    "yes",
+                                    "no"),
+         # Delito a menos de 200mts de un comisaría
+         comisarias_a_200 = if_else(dist_comisaria <= 200,
+                                    "yes",
+                                    "no"),
+         # Delito a menos de 100mts de un banco
+         bancos_a_100 = if_else(dist_bancos <= 100,
+                                "yes",
+                                "no"),
+         # Delito a menos de 200mts de un banco
+         bancos_a_200 = if_else(dist_bancos <= 200,
+                                "yes",
+                                "no"))
+
+# Por último, cargamos nuestro dataset del precio del metro cuadrado de venta de departamentos por barrio. Fuente: https://www.lanacion.com.ar/propiedades/casas-y-departamentos/mapa-interactivo-los-precios-de-venta-y-de-alquiler-de-las-propiedades-en-cada-barrio-porteno-nid22022026/ 
+precio <- read.csv("data/precios_m2_caba.csv") %>% 
+  mutate(barrio = str_to_upper(barrio),
+         barrio = herramientas::remover_tildes(barrio)) %>% 
+  select(-unit)
+
+# Aplicamos algunos cambios al dataset de delitos para poder hacer el join
+delito <- delito %>% 
+  mutate(barrio = str_remove_all(barrio, "[:punct:]"),
+         barrio = case_when(barrio == "BOCA" ~ "LA BOCA",
+                            barrio == "VILLA LUGANO" ~ "LUGANO",
+                            barrio == "VILLA SANTA RITA" ~ "SANTA RITA",
+                            T ~ barrio)) %>% 
+  # y Unimos
+  left_join(precio, by = "barrio")
+
+# Cargamos el dataset de radios censales de 2010.
+# Fuente: BA DATA
+# Puede ser encontrado en https://data.buenosaires.gob.ar/dataset/informacion-censal-por-radio
+radios <- read_sf("data/informacion-censal-por-radio-2010/informacion_censal_por_radio_2010_wgs84.shp") %>% 
+  st_make_valid() %>% 
+  st_transform(st_crs(delito))
+
+# Quedemosnos con la densidad y la cantidad de hogares con necesidades básicas insatisfechas.
+radios <- radios %>% 
+  mutate(area = as.numeric(st_area(.))/1000000,
+         densidad_pob = TOTAL_POB/area,
+         pct_hogares_nbi = H_CON_NBI/T_HOGAR,
+         pct_hogares_nbi = if_else(TOTAL_POB == 0,
+                                   0,
+                                   pct_hogares_nbi)) %>% 
+  select(densidad_pob, pct_hogares_nbi)
+
+# Unimos a cada delito con el radio censal que le corresponde.
+delito <- delito %>% 
+  st_join(radios) # No es un join perfecto. Ver.
+
+# Nos quedamos solo con las variables de interes y las traducimos al inglés.
+delito <- delito %>% 
+  select("year" = anio, 
+         "month" = mes, 
+         "business_cycle" = ciclo_laboral,
+         "day" = day_month, 
+         "day_of_week" = dia,
+         "weekend" = fin_de_semana,
+         "start_of_month" = principo_mes,
+         "end_of_month" = fin_de_mes,
+         "hour" = franja,
+         "night" = noche,
+         "banking_hours" = horario_bancario,
+         "crime_type" = subtipo,
+         "weapon_use" = uso_arma,
+         "street_type" = tipo_c,
+         "atms_within_100m" = cajeros_a_100,
+         "atms_within_200m" = cajeros_a_200,
+         "atm_bank" = banco,
+         "atm_network" = red,
+         "banks_within_100m" = bancos_a_100,
+        "banks_within_200m" = bancos_a_200,
+         "police_stations_within_100m" =comisarias_a_100,
+         "police_stations_within_200m" = comisarias_a_200,
+         "price_per_sqm_usd" = value,
+         "population_density" = densidad_pob,
+         "pct_households_nbi" =  pct_hogares_nbi,
+        "neighbourhood"  = barrio,
+         "comune" = comuna)
+
+
+# Guardamos.
+delito %>% 
+  st_drop_geometry() %>% 
+  write_csv("data/delito_data.csv")
+
+
